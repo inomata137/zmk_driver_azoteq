@@ -18,6 +18,30 @@
 
 LOG_MODULE_REGISTER(tps43, CONFIG_INPUT_LOG_LEVEL);
 
+/*
+ * Dedicated work queue for trackpad event processing.
+ *
+ * The work handler blocks while putting events into the input queue. If it ran on the
+ * system work queue, a full input queue (input thread waiting for a BLE TX buffer, which
+ * is only freed from the system work queue) would deadlock the whole peripheral:
+ * key scanning and BLE TX completion would stop until power cycle.
+ */
+K_THREAD_STACK_DEFINE(tps43_work_q_stack, CONFIG_INPUT_TPS43_WORKQUEUE_STACK_SIZE);
+static struct k_work_q tps43_work_q;
+static bool tps43_work_q_started;
+
+static void tps43_work_q_start(void) {
+    if (tps43_work_q_started) {
+        return;
+    }
+
+    static const struct k_work_queue_config queue_config = {.name = "tps43_work_q"};
+    k_work_queue_start(&tps43_work_q, tps43_work_q_stack,
+                       K_THREAD_STACK_SIZEOF(tps43_work_q_stack),
+                       CONFIG_INPUT_TPS43_WORKQUEUE_PRIORITY, &queue_config);
+    tps43_work_q_started = true;
+}
+
 /**
  * @brief Ends communication window with trackpad
  *
@@ -198,7 +222,7 @@ static int tps43_i2c_write_reg8(const struct device *dev, uint16_t reg, uint8_t 
  static void tps43_rdy_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
      struct tps43_drv_data *drv_data = CONTAINER_OF(cb, struct tps43_drv_data, rdy_cb);
 
-     k_work_submit(&drv_data->work);
+     k_work_submit_to_queue(&tps43_work_q, &drv_data->work);
  }
 
 
@@ -487,7 +511,7 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_x * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d horizontally", wheel);
-                input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_NO_WAIT);
             } else {
                 // Vertical scroll
                 if (config->invert_scroll_y) {
@@ -495,14 +519,14 @@ static void tps43_work_handler(struct k_work *work) {
                 }
                 int16_t wheel = (rel_y * config->scroll_sensitivity) / 100;
                 LOG_INF("Scrolling %d vertically", wheel);
-                input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_NO_WAIT);
             }
             is_scroll_active = false;
         } else if (is_zoom_active) {
             // Zoom processing: the zoom amount comes in via rel_x
             int16_t zoom_delta = (rel_x * config->zoom_sensitivity) / 100;
             LOG_INF("Zooming %d, rel_x=%d", zoom_delta, rel_x);
-            input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_FOREVER);
+            input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_NO_WAIT);
             is_zoom_active = false;
         } else {
             // Normal cursor movement
@@ -516,8 +540,10 @@ static void tps43_work_handler(struct k_work *work) {
             }
             LOG_INF("Sending movement: dx=%d, dy=%d", rel_x, rel_y);
 
-            input_report_rel(dev, INPUT_REL_X, rel_x, false, K_FOREVER);
-            input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_FOREVER);
+            // Movement/scroll/zoom events use K_NO_WAIT: dropping one when the input queue
+            // is full is harmless, while button/touch events must not be lost.
+            input_report_rel(dev, INPUT_REL_X, rel_x, false, K_NO_WAIT);
+            input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_NO_WAIT);
         }
     }
 
@@ -1350,6 +1376,15 @@ static int tps43_init(const struct device *dev) {
 
     drv_data->dev = dev;
 
+    // Initialize semaphore to protect I2C operations
+    // First parameter - initial count (1 = available)
+    // Second parameter - maximum count (1 = binary semaphore)
+    k_sem_init(&drv_data->lock, 1, 1);
+
+    // Work and its queue must be ready before RDY interrupts are enabled
+    k_work_init(&drv_data->work, tps43_work_handler);
+    tps43_work_q_start();
+
     LOG_INF("=== Azoteq tps43 driver for device %s ===", dev->name);
 
     // Check I2C bus
@@ -1413,13 +1448,6 @@ static int tps43_init(const struct device *dev) {
 
     drv_data->initialized = true;
     drv_data->suspended = false;
-
-    // Initialize semaphore to protect I2C operations
-    // First parameter - initial count (1 = available)
-    // Second parameter - maximum count (1 = binary semaphore)
-    k_sem_init(&drv_data->lock, 1, 1);
-
-    k_work_init(&drv_data->work, tps43_work_handler);
 
     tps43_dump_registers(dev);
 
